@@ -1,0 +1,12 @@
+# Scores and renders (copyrighted material, not part of the project)
+example/
+input/
+output/
+
+# Downloaded by setup.sh
+vendor/
+.venv/
+
+__pycache__/
+*.pyc
+.DS_Store

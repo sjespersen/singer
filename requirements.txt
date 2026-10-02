@@ -1,0 +1,8 @@
+pymupdf
+numpy
+scipy
+lameenc
+pyworld
+onnxruntime
+pyyaml
+setuptools<81  # pyworld still imports pkg_resources
