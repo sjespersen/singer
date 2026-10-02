@@ -27,6 +27,9 @@ with `--musicxml` the recognised score, which you can open in MuseScore to check
    A staff shared by two parts ("B./Bar.", "S1/S2") becomes two parts. The higher voice type
    takes the upper notes and the other the lower ones. Where the staff shows one line, both sing it.
    Text printed above such a staff belongs to its upper voice.
+   Older Sibelius exports (the non-"Std" Opus fonts) work too, as do scores that only label the
+   first system: later systems take its staff names, and a system with fewer staves is taken
+   to hide its top staves (a solo above the choir).
    It only works on vector PDFs; scanned scores would need an OMR tool such as Audiveris first.
 2. **Lyrics to phonemes** (`singer/phonemes.py`): espeak-ng phonemises whole words, which are then
    split over the notes. Scat syllables have fixed pronunciations (`SCAT` in `phonemes.py`):

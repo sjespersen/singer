@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
+from itertools import combinations
 from dataclasses import dataclass, field
 
 import pymupdf
@@ -169,17 +170,27 @@ class Chord:
 # --------------------------------------------------------------------------- extraction
 
 
+def _music_char(ch: str) -> str:
+    # older Sibelius PDFs (the non-"Std" Opus fonts) store glyphs as Symbol-encoded
+    # private-use codes U+F0xx, where xx is the Mac Roman position of the Std character
+    if 0xF020 <= ord(ch) <= 0xF0FF:
+        return bytes([ord(ch) - 0xF000]).decode("mac_roman")
+    return ch
+
+
 def _extract_page(page):
     glyphs, words = [], []
     raw = page.get_text("rawdict")
     for b in raw["blocks"]:
         for ln in b.get("lines", []):
             for s in ln["spans"]:
-                font = s["font"]
+                font = s["font"].split("+")[-1]
                 if font.startswith("Opus"):
+                    if not font.endswith("Std"):
+                        font += "Std"
                     for c in s["chars"]:
                         if c["c"].strip():
-                            glyphs.append(Glyph(font, c["c"], c["origin"][0], c["origin"][1], c["bbox"][0], c["bbox"][2], s["size"]))
+                            glyphs.append(Glyph(font, _music_char(c["c"]), c["origin"][0], c["origin"][1], c["bbox"][0], c["bbox"][2], s["size"]))
                     continue
                 cur = []
                 for c in s["chars"] + [None]:
@@ -306,6 +317,7 @@ class PdfScoreReader:
             for sy in systems:
                 self._assign_names(sy, words)
                 self._assign_objects(sy, glyphs, lines)
+                self._inherit_names(sy)
                 self._find_barlines(sy, lines, glyphs)
                 sy.beams = beams
                 sy.curves = curves
@@ -324,7 +336,30 @@ class PdfScoreReader:
             cands = [w for w in words if w.x1 < st.x0 - 2 and abs(w.y - st.mid - st.space * 0.8) < st.space * 2.5]
             cands = [w for w in cands if not w.text.isdigit()]
             cands.sort(key=lambda w: w.x0)
-            st.name = " ".join(w.text for w in cands).strip() or f"Staff{sy.staves.index(st) + 1}"
+            st.name = " ".join(w.text for w in cands).strip()
+
+    def _inherit_names(self, sy: System):
+        """Some scores label only the first system. Unlabeled staves take the names of the
+        last labeled system: by position, or, when parts are hidden, by clef, assuming the
+        hidden staves are the top ones (a solo above the choir)."""
+        def clef(st):
+            cl = [g for g in st.glyphs if g.font == MUSIC_FONT and g.ch in CLEFS]
+            return min(cl, key=lambda g: g.x).ch if cl else None
+
+        ref = getattr(self, "_labeled", None)
+        if all(st.name for st in sy.staves):
+            self._labeled = [(st.name, clef(st)) for st in sy.staves]
+            return
+        if ref and not any(st.name for st in sy.staves) and len(sy.staves) <= len(ref):
+            clefs = [clef(st) for st in sy.staves]
+            fits = [idx for idx in combinations(range(len(ref)), len(sy.staves))
+                    if all(ref[i][1] == c for i, c in zip(idx, clefs))]
+            if fits:
+                for st, i in zip(sy.staves, max(fits, key=sum)):
+                    st.name = ref[i][0]
+                return
+        for i, st in enumerate(sy.staves):
+            st.name = st.name or f"Staff{i + 1}"
 
     def _assign_objects(self, sy: System, glyphs, lines):
         for g in glyphs:
@@ -427,7 +462,7 @@ class PdfScoreReader:
         for stem in stems:
             attached = []
             for h in heads:
-                if id(h) in used:
+                if id(h) in used or h.ch == "w":  # whole notes have no stem
                     continue
                 if (_up_side(stem, h, sp) or _down_side(stem, h, sp)) and stem.y0 - sp * 0.7 <= h.y <= stem.y1 + sp * 0.7:
                     attached.append(h)
@@ -458,12 +493,26 @@ class PdfScoreReader:
                         flag = max(flag, FLAGS[g.ch])
                 c.beams = max(n_beams, flag)
             chords.append(c)
-        for h in heads:
-            if id(h) not in used:
-                if h.ch == "w":
-                    chords.append(Chord(x=h.x0, heads=[h], stem=None, up=h.y < st.mid, base=4.0))
-                else:
-                    self.warn(f"page {st.page + 1} staff {st.name}: notehead without stem at x={h.x:.0f}")
+        wholes: list[list[Glyph]] = []  # stemless whole notes at one spot form one chord
+        for h in sorted((h for h in heads if id(h) not in used), key=lambda h: h.x0):
+            if h.ch != "w":
+                self.warn(f"page {st.page + 1} staff {st.name}: notehead without stem at x={h.x:.0f}")
+            elif wholes and h.x0 - wholes[-1][0].x0 < sp * 1.6:
+                wholes[-1].append(h)
+            else:
+                wholes.append([h])
+        for group in wholes:
+            # next to a stemmed chord they are the other voice: upper unless they sit lower
+            # (in a unison, the voice opposite the stem direction)
+            near = [c for c in chords if c.stem is not None and abs(c.x - group[0].x0) < sp * 2.2]
+            top = min(h.y for h in group)
+            if not near:
+                up = top < st.mid
+            elif near[0].up:
+                up = top < min(h.y for h in near[0].heads) - 0.5
+            else:
+                up = top < max(h.y for h in near[0].heads) + 0.5
+            chords.append(Chord(x=min(h.x0 for h in group), heads=group, stem=None, up=up, base=4.0))
         # rests
         for g in st.glyphs:
             if g.font == MUSIC_FONT and g.ch in RESTS and g.size > 13:
@@ -719,6 +768,14 @@ class PdfScoreReader:
                 if raw:
                     part.voices.extend(self._build_voices(raw))
             if part.voices:
+                # the main line takes text written under another voice at the same moment
+                # (a verse with its own rhythm, or words set below the lower divisi note)
+                for v in part.voices[1:]:
+                    other = {round(n.start, 4): n for n in v.notes if n.lyrics}
+                    for n in part.voices[0].notes:
+                        src = other.get(round(n.start, 4))
+                        if src is not None:
+                            n.lyrics = {**src.lyrics, **n.lyrics}
                 # divisi lines without their own text sing the words of the main line
                 main = {round(n.start, 4): n for n in part.voices[0].notes}
                 for v in part.voices[1:]:
@@ -822,7 +879,7 @@ class PdfScoreReader:
         two = False
         for a in notes:
             for b in notes:
-                if a is not b and a.up and not b.up and abs(a.x - b.x) < st.space * 1.6:
+                if a is not b and a.up and not b.up and abs(a.x - b.x) < st.space * (2.2 if a.stem is None or b.stem is None else 1.6):
                     two = True
         if not two:
             total = sum(e.dur for e in evs if not e.full_measure_rest)
@@ -878,7 +935,11 @@ class PdfScoreReader:
                 if where == "above":
                     # text above a staff only belongs to its upper voice, which happens on
                     # staves shared by two parts ("B./Bar.") or with two voices
-                    two_voices = n.up and any(not e.up for e in notes if abs(e.x - n.x) < sp * 1.6 and e is not n)
+                    bar = [b.x for b in sy.barlines]
+                    same_bar = lambda e: sum(bx < e.x for bx in bar) == sum(bx < n.x for bx in bar)
+                    # a held whole note in the other voice may start well before this note
+                    two_voices = n.up and any(not e.up for e in notes if e is not n and (
+                        abs(e.x - n.x) < sp * 1.6 or (e.stem is None and e.base == 4 and same_bar(e))))
                     if not ("/" in st.name or two_voices):
                         continue
                     score = dx + 0.8 * gap + 2
